@@ -1,7 +1,7 @@
 "use client";
-import { useState, useEffect, useCallback, useRef, Suspense } from "react";
+import { useState, useEffect, useCallback, useRef, useTransition, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { API_BASE as API } from "@/lib/api";
+import { getJSON } from "@/lib/api";
 import { teamColor, teamShort } from "@/lib/teams";
 import { useBackendPulse } from "@/components/system/BackendPulseProvider";
 
@@ -10,6 +10,7 @@ function MatchHubContent() {
     const searchParams = useSearchParams();
     const { status: backendStatus, checkNow } = useBackendPulse();
     const retriedAfterWake = useRef(false);
+    const [openingMatch, startOpeningMatch] = useTransition();
 
     const [selectedYear, setSelectedYear] = useState(null);
     const [selectedTeam, setSelectedTeam] = useState(null);
@@ -55,9 +56,7 @@ function MatchHubContent() {
         setLoading(prev => ({ ...prev, years: true }));
         setError(false);
         try {
-            const res = await fetch(`${API}/api/metadata/years`);
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const data = await res.json();
+            const data = await getJSON(`/api/metadata/years`);
             setYears(data.years || []);
         } catch (err) {
             console.error("Backend Offline: Years", err);
@@ -84,11 +83,12 @@ function MatchHubContent() {
             setAvailableTeams([]);
             return;
         }
+        let active = true;
         const fetchTeams = async () => {
             setLoading(prev => ({ ...prev, teams: true }));
             try {
-                const res = await fetch(`${API}/api/metadata/teams?year=${selectedYear}`);
-                const data = await res.json();
+                const data = await getJSON(`/api/metadata/teams?year=${selectedYear}`);
+                if (!active) return;
                 const teamMap = data.teams.map(t => ({
                     short: teamShort(t),
                     name: t,
@@ -98,10 +98,11 @@ function MatchHubContent() {
             } catch (error) {
                 console.error("Backend Offline: Teams", error);
             } finally {
-                setLoading(prev => ({ ...prev, teams: false }));
+                if (active) setLoading(prev => ({ ...prev, teams: false }));
             }
         };
         fetchTeams();
+        return () => { active = false; };
     }, [selectedYear]);
 
     // 3️⃣ Fetch ALL Matches when Team is Selected 
@@ -112,11 +113,12 @@ function MatchHubContent() {
             setSelectedOpponent(null);
             return;
         }
+        let active = true;
         const fetchMatches = async () => {
             setLoading(prev => ({ ...prev, matches: true }));
             try {
-                const res = await fetch(`${API}/api/metadata/matches?year=${selectedYear}&team=${encodeURIComponent(selectedTeam.name)}`);
-                const data = await res.json();
+                const data = await getJSON(`/api/metadata/matches?year=${selectedYear}&team=${encodeURIComponent(selectedTeam.name)}`);
+                if (!active) return;
                 const formatted = data.matches.map(m => {
                     const oppName = m.title.replace("vs ", "");
                     return {
@@ -136,10 +138,11 @@ function MatchHubContent() {
             } catch (error) {
                 console.error("Backend Offline: Matches", error);
             } finally {
-                setLoading(prev => ({ ...prev, matches: false }));
+                if (active) setLoading(prev => ({ ...prev, matches: false }));
             }
         };
         fetchMatches();
+        return () => { active = false; };
     }, [selectedYear, selectedTeam]);
 
     // 4️⃣ Client-side filter by opponent
@@ -241,6 +244,7 @@ function MatchHubContent() {
                             ) : (
                                 <div className="relative">
                                     <select
+                                        disabled={loading.teams || loading.matches}
                                         value={selectedYear || ""}
                                         onChange={(e) => {
                                             const val = e.target.value;
@@ -279,7 +283,7 @@ function MatchHubContent() {
                                         const teamObj = availableTeams.find(t => t.name === val);
                                         setSelectedTeam(teamObj || null);
                                     }}
-                                    disabled={!selectedYear}
+                                    disabled={!selectedYear || loading.teams || loading.matches}
                                     className="w-full bg-[#0e1117]/50 border border-white/10 rounded-xl px-4 py-3 text-white text-sm focus:outline-none focus:border-[#46b485] transition-colors appearance-none pr-10 disabled:cursor-not-allowed cursor-pointer"
                                     style={{
                                         backgroundImage: `url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'></polyline></svg>")`,
@@ -311,7 +315,7 @@ function MatchHubContent() {
                                         const oppObj = availableOpponents.find(o => o.name === val);
                                         setSelectedOpponent(oppObj || null);
                                     }}
-                                    disabled={allMatches.length === 0}
+                                    disabled={allMatches.length === 0 || loading.matches}
                                     className="w-full bg-[#0e1117]/50 border border-white/10 rounded-xl px-4 py-3 text-white text-sm focus:outline-none focus:border-[#46b485] transition-colors appearance-none pr-10 disabled:cursor-not-allowed cursor-pointer"
                                     style={{
                                         backgroundImage: `url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'></polyline></svg>")`,
@@ -348,6 +352,12 @@ function MatchHubContent() {
                     )}
                 </div>
 
+                {(loading.teams || loading.matches || openingMatch) && (
+                    <p role="status" aria-live="polite" className="mb-5 flex items-center gap-3 font-mono text-sm text-[#7fd3ac]">
+                        <span aria-hidden="true" className="h-4 w-4 animate-spin rounded-full border-2 border-white/10 border-t-[#46b485]" />
+                        {openingMatch ? "Opening match…" : loading.teams ? "Loading teams…" : "Loading matches…"}
+                    </p>
+                )}
                 {/* Match Results Grid */}
                 <div className="space-y-6 md:space-y-8">
                     <div className="flex items-center gap-3 md:gap-4 text-[10px] md:text-[11px] font-mono text-white tracking-[0.2em] uppercase">
@@ -357,7 +367,7 @@ function MatchHubContent() {
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6">
-                        {loading.matches && filteredMatches.length === 0 && Array.from({ length: 4 }).map((_, i) => (
+                        {loading.matches && Array.from({ length: 4 }).map((_, i) => (
                             <div key={`sk-${i}`} className="animate-pulse bg-[#0e1117] rounded-2xl md:rounded-3xl border border-white/5 overflow-hidden">
                                 <div className="h-1.5 md:h-2 w-full bg-white/5"></div>
                                 <div className="p-6 md:p-8">
@@ -375,10 +385,13 @@ function MatchHubContent() {
                                 </div>
                             </div>
                         ))}
-                        {filteredMatches.map((match, i) => (
+                        {!loading.matches && filteredMatches.map((match, i) => (
                             <button
                                 key={match.id}
-                                onClick={() => router.push(`/simulation/${match.id}`)}
+                                disabled={openingMatch}
+                                onClick={() => {
+                                    startOpeningMatch(() => router.push(`/simulation/${match.id}`));
+                                }}
                                 className="group block w-full text-left bg-[#0e1117] rounded-2xl md:rounded-3xl border border-white/5 hover:border-[#46b485]/40 overflow-hidden transition-all duration-500 hover:shadow-[0_10px_40px_rgba(70,180,133,0.1)] hover:-translate-y-1 animate-in slide-in-from-bottom-8 fade-in"
                                 style={{ animationDelay: `${i * 50}ms`, animationFillMode: "both" }}
                             >

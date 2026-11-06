@@ -2,11 +2,15 @@
 import { useParams, useRouter } from "next/navigation";
 import { useState, useEffect } from "react";
 import Link from "next/link";
-import { API_BASE as API } from "@/lib/api";
+import { getJSON } from "@/lib/api";
 import { teamColor as tc, teamShort as ts } from "@/lib/teams";
 
 export default function MatchDetailPage() {
   const { matchId } = useParams();
+  return <MatchDetail key={matchId} matchId={matchId} />;
+}
+
+function MatchDetail({ matchId }) {
   const router = useRouter();
 
   const [loading, setLoading] = useState(true);
@@ -14,32 +18,34 @@ export default function MatchDetailPage() {
   const [matchMeta, setMatchMeta] = useState(null);
   const [activeInnings, setActiveInnings] = useState(1);
   const [inningsData, setInningsData] = useState(null);
-  const [loadingInnings, setLoadingInnings] = useState(false);
+  const [loadingInnings, setLoadingInnings] = useState(true);
   const [ballData, setBallData] = useState(null);
   const [viewMode, setViewMode] = useState("wickets"); // "wickets" | "overs"
 
   // Load match metadata + ball data on mount
   useEffect(() => {
-    setLoading(true);
+    let active = true;
     Promise.all([
-      fetch(`${API}/api/metadata/match/${matchId}`).then(r => r.json()).catch(() => null),
-      fetch(`${API}/api/match/${matchId}/balls`).then(r => r.json()).catch(() => null),
+      getJSON(`/api/metadata/match/${matchId}`).catch(() => null),
+      getJSON(`/api/match/${matchId}/balls`).catch(() => null),
     ]).then(([meta, balls]) => {
-      if (!meta) { setError("Could not load match. Is backend running?"); setLoading(false); return; }
+      if (!active) return;
+      if (!meta?.id || !balls?.["1"]) { setError("Could not load match. Is backend running?"); setLoading(false); return; }
       setMatchMeta(meta);
       setBallData(balls);
       setLoading(false);
     });
+    return () => { active = false; };
   }, [matchId]);
 
   // Load innings detail when innings changes
   useEffect(() => {
     if (!matchId) return;
-    setLoadingInnings(true);
-    fetch(`${API}/api/match/${matchId}/innings-detail?innings=${activeInnings}`)
-      .then(r => r.json())
-      .then(data => { setInningsData(data); setLoadingInnings(false); })
-      .catch(() => { setInningsData(null); setLoadingInnings(false); });
+    let active = true;
+    getJSON(`/api/match/${matchId}/innings-detail?innings=${activeInnings}`)
+      .then(data => { if (active) { setInningsData(data); setLoadingInnings(false); } })
+      .catch(() => { if (active) { setInningsData(null); setLoadingInnings(false); } });
+    return () => { active = false; };
   }, [matchId, activeInnings]);
 
   if (loading) return (
@@ -111,7 +117,7 @@ export default function MatchDetailPage() {
             const color = tc(inn.battingTeam);
             const active = activeInnings === n;
             return (
-              <button key={n} onClick={() => setActiveInnings(n)}
+              <button key={n} onClick={() => { if (n !== activeInnings) { setLoadingInnings(true); setActiveInnings(n); } }}
                 role="tab"
                 aria-selected={active}
                 aria-label={`${inn.battingTeam}, ${inn.totalScore} for ${inn.totalWickets}`}

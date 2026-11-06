@@ -9,7 +9,6 @@ const RAW =
   (process.env.NODE_ENV === "production" ? "" : "http://localhost:8000");
 
 if (!RAW && typeof window !== "undefined") {
-  // eslint-disable-next-line no-console
   console.error(
     "[CounterPlay] NEXT_PUBLIC_API_URL is not set — API calls will fail. " +
       "Set it in your Vercel/Render environment."
@@ -24,10 +23,10 @@ export const API_BASE = RAW.replace(/\/+$/, "");
  * so callers can render real error/empty states instead of hanging forever.
  *
  * @param {string} path  Path beginning with "/", e.g. "/api/metadata/years".
- * @param {object} [options]  fetch options; `timeoutMs` defaults to 15000.
+ * @param {object} [options]  fetch options; `timeoutMs` defaults to 75000.
  */
 export async function getJSON(path, options = {}) {
-  const { timeoutMs = 15000, ...init } = options;
+  const { timeoutMs = 75000, ...init } = options;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -36,7 +35,8 @@ export async function getJSON(path, options = {}) {
       signal: controller.signal,
     });
     if (!res.ok) {
-      throw new Error(`Request failed (${res.status}) for ${path}`);
+      const error = await res.json().catch(() => ({}));
+      throw new Error(typeof error.detail === "string" ? error.detail : `The engine could not complete the request (${res.status}). Please try again.`);
     }
     return await res.json();
   } finally {

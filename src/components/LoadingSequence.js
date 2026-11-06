@@ -1,85 +1,44 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
-export default function LoadingSequence({ onComplete, isArena = false }) {
-    const sequences = isArena ? [
-        "Preparing the pitch...",
-        "Analyzing team synergy and matchups...",
-        "Running 10,000 Monte Carlo battle simulations...",
-        "Calculating optimal bowler strategies...",
-        "Readying the players for battle...",
-        "Initializing battle matrix..."
-    ] : [
-        "Initializing Bayesian Profiles...",
-        "Evaluating historical parameter matrices...",
-        "Generating alternate timelines...",
-        "Running 10,000 Monte Carlo Simulations...",
-        "Hunting Target Timeline reality...",
-        "Locking Simulation Matrix..."
-    ];
-
-    const [index, setIndex] = useState(0);
+export default function LoadingSequence({ ready = false, isArena = false }) {
     const [progress, setProgress] = useState(0);
+    const dialog = useRef(null);
 
     useEffect(() => {
+        const modal = dialog.current;
+        modal.showModal();
         const interval = setInterval(() => {
-            setIndex((prev) => {
-                if (prev < sequences.length - 1) return prev + 1;
-                return prev;
-            });
-        }, 500); // Sequence text updates every 500ms
+            setProgress(previous => Math.min(90, previous + (previous < 60 ? 3 : 1)));
+        }, 180);
+        return () => { clearInterval(interval); modal.close(); };
+    }, []);
 
-        const progressInterval = setInterval(() => {
-            setProgress((prev) => {
-                if (prev >= 100) {
-                    clearInterval(progressInterval);
-                    clearInterval(interval);
-                    setTimeout(onComplete, 300); // Brief pause before firing complete
-                    return 100;
-                }
-                return prev + 3; // Rapidly counts up to simulate crunching
-            });
-        }, 50);
-
-        return () => {
-            clearInterval(interval);
-            clearInterval(progressInterval);
-        };
-    }, [onComplete, sequences.length]);
+    const displayed = ready ? 100 : progress;
+    const message = ready ? "Ready. Opening your match…"
+        : progress >= 90 ? "Still processing your match. Please keep this page open…"
+        : isArena ? "Preparing your teams and simulating the match…"
+        : "Calculating your alternate timeline…";
 
     return (
-        <div className="fixed inset-0 z-[100] bg-[#0e1117]/95 backdrop-blur-xl flex flex-col items-center justify-center animate-fade-in grid-bg">
-            <div className="text-center max-w-lg w-full px-6">
-                {/* Tech Spinner Animation */}
-                <div className="relative w-24 h-24 mx-auto mb-8">
-                    <div className="absolute inset-0 border-t-2 border-[#46b485] rounded-full animate-spin" style={{ animationDuration: "1s" }} />
-                    <div className="absolute inset-2 border-r-2 border-[#5b79ef] rounded-full animate-spin" style={{ animationDuration: "1.5s", animationDirection: "reverse" }} />
-                    <div className="absolute inset-4 border-b-2 border-[#7fd3ac] rounded-full animate-spin" style={{ animationDuration: "0.8s" }} />
-                    <div className="absolute inset-0 flex items-center justify-center">
-                        <span className="text-xs font-mono text-white font-bold">{progress}%</span>
-                    </div>
+        <dialog ref={dialog} onCancel={event => event.preventDefault()} aria-labelledby="simulation-loading-title"
+            className="fixed inset-0 z-[100] m-0 h-dvh max-h-none w-screen max-w-none border-0 bg-[#0e1117]/95 p-6 text-white backdrop:bg-black/70 backdrop-blur-xl">
+            <div className="flex h-full flex-col items-center justify-center text-center">
+                <div className="relative mb-8 flex h-24 w-24 items-center justify-center">
+                    <div aria-hidden="true" className="absolute inset-0 animate-spin rounded-full border-t-2 border-[#46b485]" />
+                    <span className="font-mono text-sm">{displayed}%</span>
                 </div>
-
-                <h2 className="text-2xl font-black text-white mb-2 tracking-widest drop-shadow-md uppercase">
-                    {isArena ? "Ready to Battle" : "Rewriting Reality"}
+                <h2 id="simulation-loading-title" className="text-2xl font-black uppercase tracking-widest">
+                    {isArena ? "Preparing your match" : "Rewriting reality"}
                 </h2>
-                <div className="h-6 overflow-hidden relative">
-                    <p className="text-sm font-mono text-[#46b485] animate-pulse">
-                        &gt; {sequences[index]}
-                    </p>
+                <p role="status" aria-live="polite" className="mt-4 max-w-md text-sm text-[#aeb8c8]">{message}</p>
+                <div role="progressbar" aria-label="Estimated simulation progress" aria-valuemin={0} aria-valuemax={100}
+                    aria-valuenow={displayed} aria-valuetext={ready ? "Complete" : `${displayed} percent estimated; waiting for engine`}
+                    className="mt-8 h-1 w-full max-w-md overflow-hidden rounded-full bg-white/10">
+                    <div className="h-full bg-[#46b485] transition-all duration-150" style={{ width: `${displayed}%` }} />
                 </div>
-
-                {/* Cyberpunk Progress Bar */}
-                <div className="w-full h-1 bg-white/10 rounded-full mt-8 overflow-hidden relative">
-                    <div
-                        className="absolute top-0 left-0 h-full bg-[#46b485] shadow-[0_0_10px_#46b485] transition-all duration-75 ease-linear"
-                        style={{ width: `${progress}%` }}
-                    />
-                </div>
-                <p className="text-[10px] text-[#7c8696] font-mono mt-4 text-center tracking-widest">
-                    M1 ENGINE • CLUSTER NODE 04
-                </p>
+                {!ready && <p className="mt-4 text-xs text-[#7c8696]">Progress is estimated. You don’t need to click again.</p>}
             </div>
-        </div>
+        </dialog>
     );
 }

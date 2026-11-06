@@ -2,7 +2,9 @@
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useState, useEffect, useRef, useCallback, useMemo, Suspense } from "react";
 import LiveDashboard from "./LiveDashboard";
-import { API_BASE as API } from "@/lib/api";
+import { getJSON } from "@/lib/api";
+import useBackendAction from "@/hooks/useBackendAction";
+import BackendActionFeedback from "@/components/system/BackendActionFeedback";
 
 // ─── Colour helpers ─────────────────────────────────────────
 const TEAM_COLORS = {
@@ -94,6 +96,8 @@ function SimulationPageContent() {
   const [innings, setInnings] = useState(null);   // { "1": {...}, "2": {...} }
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const simulationAction = useBackendAction();
+  const runSimulation = simulationAction.run;
 
   // ── UI state
   const [activeInnings, setActiveInnings] = useState(1);
@@ -129,11 +133,11 @@ function SimulationPageContent() {
   useEffect(() => {
     setLoading(true);
     Promise.all([
-      fetch(`${API}/api/metadata/match/${matchId}`).then(r => r.json()).catch(() => null),
-      fetch(`${API}/api/match/${matchId}/balls`).then(r => r.json()).catch(() => null),
-      fetch(`${API}/api/match/${matchId}/rosters`).then(r => r.json()).catch(() => null),
+      getJSON(`/api/metadata/match/${matchId}`).catch(() => null),
+      getJSON(`/api/match/${matchId}/balls`).catch(() => null),
+      getJSON(`/api/match/${matchId}/rosters`).catch(() => null),
     ]).then(([meta, ballData, rosterData]) => {
-      if (!meta || !ballData) { setError("Could not load match data. Ensure the backend is running."); setLoading(false); return; }
+      if (!meta?.id || !ballData?.["1"]) { setError("Could not load match data. Ensure the backend is running."); setLoading(false); return; }
       
       // Transformation removed to keep 0-indexed data but will use +1 in labels
 
@@ -268,7 +272,7 @@ function SimulationPageContent() {
     simIntervalRef.current = setTimeout(tick, simSpeedRef.current || 800);
   }, []);
 
-  const handleSimulate = useCallback(async () => {
+  const handleSimulate = useCallback(() => runSimulation(async () => {
     if (!selectedBall) return;
     stopSim();
     setSimBalls([]);
@@ -281,7 +285,8 @@ function SimulationPageContent() {
           : outcomeOverride !== null ? parseInt(outcomeOverride) : null;
 
     try {
-      const res = await fetch(`${API}/api/match/${matchId}/simulate-from`, {
+      const data = await getJSON(`/api/match/${matchId}/simulate-from`, {
+        timeoutMs: 120_000,
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -297,8 +302,7 @@ function SimulationPageContent() {
         }),
       });
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Simulation Error");
+      if (!data.success || !Array.isArray(data.ballLog)) throw new Error("The engine returned an incomplete simulation. Please try again.");
       
       setSimResult(data);
       setSimMode(true);
@@ -429,10 +433,9 @@ function SimulationPageContent() {
       simStateRef.current = null;
       startSimTick();
     } catch (err) {
-      console.error("Simulation error:", err);
-      setError("Simulation failed: " + err.message);
+      throw err;
     }
-  }, [selectedBall, activeInnings, outcomeOverride, matchId, innings, startSimTick, stopSim]);
+  }), [runSimulation, selectedBall, activeInnings, outcomeOverride, matchId, innings, startSimTick, stopSim, newStriker, newBowler]);
 
   // ── Pause & resume
   const handlePause = () => stopSim();
@@ -557,7 +560,7 @@ function SimulationPageContent() {
     };
   };
 
-  const handleBranchSimulate = useCallback(async (targetBallIndex, outcome, currentStriker, currentNonStriker, currentBowler) => {
+  const handleBranchSimulate = useCallback((targetBallIndex, outcome, currentStriker, currentNonStriker, currentBowler) => runSimulation(async () => {
     stopSim();
     setWinnerDeclared(null);
 
@@ -591,7 +594,8 @@ function SimulationPageContent() {
     }
 
     try {
-      const res = await fetch(`${API}/api/match/${matchId}/simulate-from`, {
+      const data = await getJSON(`/api/match/${matchId}/simulate-from`, {
+        timeoutMs: 120_000,
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -622,8 +626,7 @@ function SimulationPageContent() {
         }),
       });
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Simulation Error");
+      if (!data.success || !Array.isArray(data.ballLog)) throw new Error("The engine returned an incomplete simulation. Please try again.");
 
       setSimResult(data);
       setSimMode(true);
@@ -756,10 +759,9 @@ function SimulationPageContent() {
       simStateRef.current = null;
       startSimTick();
     } catch (err) {
-      console.error("Simulation error:", err);
-      setError("Simulation failed: " + err.message);
+      throw err;
     }
-  }, [alternateBalls, activeInnings, innings, rosters, matchId, simBalls, startSimTick, stopSim]);
+  }), [runSimulation, alternateBalls, activeInnings, innings, rosters, matchId, simBalls, startSimTick, stopSim]);
 
 
   // ── Render helpers ────────────────────────────────────────
@@ -818,7 +820,8 @@ function SimulationPageContent() {
   const target = activeInnings === 2 && innings1 ? innings1.totalScore + 1 : null;
 
   return (
-    <div className="min-h-screen grid-bg">
+    <div className="min-h-screen grid-bg" aria-busy={simulationAction.pending}>
+      <BackendActionFeedback action={simulationAction} />
 
       {/* ── Header ────────────────────────────────────────── */}
       <header className="sticky top-0 z-50 border-b border-white/[0.06] bg-[#0e1117]/90 backdrop-blur-md">
@@ -1158,10 +1161,11 @@ function SimulationPageContent() {
                 {/* Simulate button */}
                 <button
                   onClick={handleSimulate}
+                  disabled={simulationAction.pending}
                   className="w-full py-2.5 md:py-3.5 rounded-xl font-black text-xs md:text-sm tracking-widest text-white transition-all duration-300 hover:scale-[1.02] active:scale-[0.98]"
                   style={{ background: "linear-gradient(135deg, #46b485, #5b79ef)", boxShadow: "0 0 24px rgba(70,180,133,0.25)" }}
                 >
-                  ⚡ SIMULATE FROM THIS BALL
+                  {simulationAction.pending ? "PROCESSING…" : "⚡ SIMULATE FROM THIS BALL"}
                 </button>
               </div>
             </div>

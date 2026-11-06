@@ -5,9 +5,10 @@ import ArenaSetup from "@/components/arena/ArenaSetup";
 import ArenaDraft from "@/components/arena/ArenaDraft";
 import ArenaLineups from "@/components/arena/ArenaLineups";
 import ArenaSteps from "@/components/arena/ArenaSteps";
-import LoadingSequence from "@/components/LoadingSequence";
+import useBackendAction from "@/hooks/useBackendAction";
+import BackendActionFeedback from "@/components/system/BackendActionFeedback";
 import LiveDashboard from "@/app/simulation/[matchId]/LiveDashboard";
-import { API_BASE as API } from "@/lib/api";
+import { getJSON } from "@/lib/api";
 
 // Maps the engine phase to a step index for the progress indicator.
 const PHASE_TO_STEP = { setup: 0, draft: 1, lineups: 2, loading: 3, simulating: 3, done: 3 };
@@ -16,6 +17,8 @@ export default function ArenaPage() {
 
     // Engine State: 'setup' | 'draft' | 'lineups' | 'loading' | 'simulating' | 'done'
     const [phase, setPhase] = useState('setup');
+    const arenaAction = useBackendAction();
+    const runArena = arenaAction.run;
 
     // Core Game State
     const [p1, setP1] = useState("");
@@ -63,7 +66,7 @@ export default function ArenaPage() {
 
     const handleLineupsComplete = (data) => {
         setLineupData(data);
-        setPhase('loading');
+        handleLoadingComplete(data);
     };
 
     const setSpeed = (s) => { setSimSpeed(s); simSpeedRef.current = s; };
@@ -139,28 +142,27 @@ export default function ArenaPage() {
         simIntervalRef.current = setTimeout(tick, simSpeedRef.current);
     }, []);
 
-    const handleLoadingComplete = useCallback(async () => {
+    const handleLoadingComplete = useCallback((data) => runArena(async () => {
+        setPhase('loading');
         try {
-            const response = await fetch(`${API}/api/simulate/arena/full`, {
+            const matchData = await getJSON(`/api/simulate/arena/full`, {
+                timeoutMs: 120_000,
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     p1, p2,
-                    t1Roster: lineupData.t1BattingOrder,
-                    t2Roster: lineupData.t2BattingOrder,
-                    t1BowlingOrder: lineupData.t1BowlingOrder,
-                    t2BowlingOrder: lineupData.t2BowlingOrder,
-                    tossWinner: lineupData.tossWinner,
-                    tossDecision: lineupData.tossDecision
+                    t1Roster: data.t1BattingOrder,
+                    t2Roster: data.t2BattingOrder,
+                    t1BowlingOrder: data.t1BowlingOrder,
+                    t2BowlingOrder: data.t2BowlingOrder,
+                    tossWinner: data.tossWinner,
+                    tossDecision: data.tossDecision
                 })
             });
 
-            if (!response.ok) {
-                const errData = await response.json().catch(() => ({}));
-                throw new Error(errData.detail || "Arena backend failure.");
+            if (!Array.isArray(matchData.ballLog) || matchData.ballLog.length === 0) {
+                throw new Error("The engine returned an incomplete match. Please try again.");
             }
-
-            const matchData = await response.json();
             setResults(matchData);
             resultsRef.current = matchData;
             
@@ -175,11 +177,10 @@ export default function ArenaPage() {
             }, 500);
             
         } catch (error) {
-            console.error("Simulation Engine Error:", error);
-            setSimError(error.message || "The match engine didn't respond.");
-            setPhase('lineups'); // Go back to retry
+            setPhase('lineups');
+            throw error;
         }
-    }, [p1, p2, lineupData, startSimTick]);
+    }), [runArena, p1, p2, startSimTick]);
 
     const handlePause = () => stopSim();
     const handleResume = () => startSimTick();
@@ -242,7 +243,7 @@ export default function ArenaPage() {
                 </div>
             )}
 
-            {phase === 'loading' && <LoadingSequence onComplete={handleLoadingComplete} isArena={true} />}
+            <BackendActionFeedback action={arenaAction} isArena />
 
             {phase === 'simulating' && results && (
                 <div className="min-h-screen lg:h-screen w-full relative flex flex-col">
