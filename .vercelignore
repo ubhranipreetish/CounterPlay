@@ -1,0 +1,5 @@
+# Only the Next.js frontend is deployed to Vercel.
+backend/
+changes/
+generate_players.py
+render.yaml

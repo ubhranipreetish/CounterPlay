@@ -42,8 +42,8 @@ By pinpointing any turning point in historical IPL matches, overriding the ball'
 ## ⚙️ Setup & Installation
 
 ### Prerequisites
-* **Node.js** (v18 or higher)
-* **Python** (v3.9 or higher)
+* **Node.js** (v22 or v24 LTS)
+* **Python** (v3.12; deployed with 3.12.16)
 
 ### 1. Backend Setup
 Create a virtual environment, activate it, and install python dependencies:
@@ -55,7 +55,7 @@ cd backend
 python3 -m venv venv
 
 # Activate on Mac/Linux:
-source venv/bin/path/activate
+source venv/bin/activate
 
 # Or on Windows:
 venv\Scripts\activate
@@ -97,3 +97,59 @@ by a browser heartbeat. Render Free sleeps after 15 minutes without incoming
 traffic. To prevent idle sleep independently of visitors, use an always-on paid
 Render instance; see https://render.com/docs/faq. These source changes must be
 deployed before they affect the hosted website.
+
+
+## Deploy a new project (Render + Vercel)
+
+Both services use this repository's `main` branch. Push these deployment files
+before importing the repository into either host. Do not reuse the old services.
+
+### 1. Render backend
+
+Create a new **Web Service**, connect `ubhranipreetish/CounterPlay`, and use:
+
+| Setting | Value |
+| --- | --- |
+| Runtime | Python |
+| Branch | `main` |
+| Root directory | `backend` |
+| Build command | `pip install -r requirements.txt` |
+| Start command | `uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1` |
+| Instance type | Free |
+| Health check path | `/api/health` |
+| `PYTHON_VERSION` | `3.12.16` |
+| `PYTHONUNBUFFERED` | `1` |
+
+Alternatively create a **Blueprint** using the root `render.yaml`; it defines
+these same settings. Set `FRONTEND_URL` to your actual Vercel production origin
+when it is known. For a Blueprint, provide the intended Vercel origin initially
+and correct it after Vercel assigns the domain.
+
+Use a single worker because each process loads its own copy of the IPL dataset.
+Both backend CSV files must remain in GitHub. Wait for the service to become
+live, then open `https://YOUR-SERVICE.onrender.com/api/health`. The engine is
+ready when it returns `"status": "ok"`; `"warming"` means initialization is
+still running. API documentation is available at `/docs`.
+
+### 2. Vercel frontend
+
+Create a new **Project**, import the same repository, choose **Next.js**, and
+leave the root directory at the repository root (`./`). Use the default build
+command `npm run build`, install command `npm install`, and output directory.
+Set `NEXT_PUBLIC_API_URL` to the actual Render HTTPS origin (no `/api` suffix)
+for Production, and for Preview if previews should use the same backend. Then
+deploy. The ignored local `.env.production` file is not uploaded from GitHub.
+`.vercelignore` excludes Python code and datasets from CLI frontend uploads.
+
+### 3. Connect and verify
+
+Copy the Vercel production origin, such as `https://YOUR-PROJECT.vercel.app`,
+into Render's `FRONTEND_URL` environment variable and redeploy the backend.
+Multiple exact origins can be comma-separated. Preview domains must be added
+explicitly if they need browser access; no wildcard Vercel origins are allowed.
+Check the frontend home, match archives, and arena, then run a simulation.
+If `NEXT_PUBLIC_API_URL` changes, redeploy Vercel: Next.js embeds it at build time.
+
+Render Free can sleep without incoming traffic, and resource exhaustion can
+restart it despite heartbeats. Check Render logs if the engine cannot initialize
+within the free instance's memory limit.

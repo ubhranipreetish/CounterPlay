@@ -32,7 +32,7 @@ allowed_origins = [
 frontend_url = os.environ.get("FRONTEND_URL")
 if frontend_url:
     # Support comma-separated origins
-    origins = [o.strip() for o in frontend_url.split(",") if o.strip()]
+    origins = [o.strip().rstrip("/") for o in frontend_url.split(",") if o.strip()]
     allowed_origins.extend(origins)
 
 app.add_middleware(
