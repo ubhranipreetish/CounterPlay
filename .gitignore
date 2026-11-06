@@ -1,0 +1,80 @@
+# JavaScript dependencies and package-manager caches
+node_modules/
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+.npm/
+.pnpm-store/
+
+# Generated frontend builds and deployment state
+.next/
+/out/
+/build/
+/dist/
+.vercel/
+.netlify/
+.turbo/
+*.tsbuildinfo
+next-env.d.ts
+
+# Python environments, bytecode, packaging, and tool caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+*.egg-info/
+.eggs/
+
+# Test outputs (keep test source files)
+coverage/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+junit.xml
+playwright-report/
+test-results/
+
+# Environment values and private key files; safe examples can be committed
+.env*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# OS and editor state
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+
+# Local assistant state, personal notes, and internal change reports
+.claude/
+.codex/
+.agents/
+/AGENTS.md
+/CLAUDE.md
+/changes/
+
+# Keep project documentation such as README.md, source, tests, configuration,
+# package-lock.json, and backend CSV datasets required to run the engine.

@@ -1,0 +1,113 @@
+"use client";
+import { useState } from "react";
+import GlowButton from "@/components/GlowButton";
+
+export default function ArenaSetup({ onComplete }) {
+    const [p1, setP1] = useState("");
+    const [p2, setP2] = useState("");
+    const [flipping, setFlipping] = useState(false);
+    const [winner, setWinner] = useState(null);
+
+    const handleFlip = () => {
+        if (!p1 || !p2) return;
+        setFlipping(true);
+        setTimeout(() => {
+            const isP1 = Math.random() > 0.5;
+            setWinner(isP1 ? p1 : p2);
+            setFlipping(false);
+        }, 2000); // 2 second flip animation
+    };
+
+    const handleContinue = () => {
+        onComplete({ p1, p2, firstPick: winner });
+    };
+
+    return (
+        <div className="max-w-xl mx-auto pt-6 md:pt-10 px-4 md:px-6">
+            <div className="text-center mb-8 md:mb-10">
+                <h1 className="text-3xl sm:text-5xl font-black text-white tracking-tight drop-shadow-md mb-2">
+                    THE ARENA
+                </h1>
+                <p className="text-[#9aa3b2] font-mono text-[10px] md:text-xs uppercase tracking-widest">
+                    INITIALIZE DRAFT SEQUENCE
+                </p>
+            </div>
+
+            <div className="glass rounded-2xl md:rounded-3xl p-6 md:p-8 border border-white/10 shadow-2xl relative overflow-hidden">
+                <div className="absolute top-0 right-0 w-48 md:w-64 h-48 md:h-64 bg-[radial-gradient(circle,rgba(194,71,92,0.1)_0%,transparent_60%)] pointer-events-none" />
+
+                {!winner && !flipping && (
+                    <div className="space-y-5 md:space-y-6 relative z-10 animate-fade-in">
+                        <div>
+                            <label className="block text-[9px] md:text-[10px] font-mono font-bold text-[#46b485] tracking-widest uppercase mb-2">
+                                PLAYER 1 ALIAS
+                            </label>
+                            <input
+                                type="text"
+                                value={p1}
+                                onChange={e => setP1(e.target.value)}
+                                className="w-full bg-[#0e1117]/50 border border-white/10 rounded-xl px-4 py-2.5 md:py-3 text-white text-sm md:text-base focus:outline-none focus:border-[#46b485] transition-colors"
+                                placeholder="Enter name..."
+                                maxLength={15}
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-[9px] md:text-[10px] font-mono font-bold text-[#c2475c] tracking-widest uppercase mb-2">
+                                PLAYER 2 ALIAS
+                            </label>
+                            <input
+                                type="text"
+                                value={p2}
+                                onChange={e => setP2(e.target.value)}
+                                className="w-full bg-[#0e1117]/50 border border-white/10 rounded-xl px-4 py-2.5 md:py-3 text-white text-sm md:text-base focus:outline-none focus:border-[#c2475c] transition-colors"
+                                placeholder="Enter name..."
+                                maxLength={15}
+                            />
+                        </div>
+
+                        <div className="pt-5 md:pt-6 border-t border-white/5 text-center">
+                            <button
+                                onClick={handleFlip}
+                                disabled={!p1 || !p2}
+                                className={`w-full md:w-auto px-6 md:px-8 py-3 md:py-3.5 rounded-xl font-bold text-xs md:text-sm transition-all ${(!p1 || !p2) ? 'bg-white/5 text-white/30 cursor-not-allowed' : 'bg-[#ffd700] text-[#0e1117] shadow-[0_0_20px_rgba(255,215,0,0.3)] hover:scale-105 active:scale-95'}`}
+                            >
+                                FLIP COIN FOR FIRST PICK
+                            </button>
+                        </div>
+                    </div>
+                )}
+
+                {flipping && (
+                    <div className="py-10 md:py-12 flex flex-col items-center justify-center animate-fade-in">
+                        <div className="w-20 h-20 md:w-24 md:h-24 rounded-full bg-gradient-to-br from-[#ffd700] to-[#b8860b] shadow-[0_0_30px_rgba(255,215,0,0.5)] flex items-center justify-center animate-spin" style={{ animationDuration: "0.4s", animationTimingFunction: "linear" }}>
+                            <div className="w-16 h-16 md:w-20 md:h-20 rounded-full border-2 border-[#fff] opacity-50 flex items-center justify-center">
+                                <span className="font-black text-xl md:text-2xl text-white opacity-80">?</span>
+                            </div>
+                        </div>
+                        <p className="mt-6 md:mt-8 text-xs md:text-sm font-mono text-[#9aa3b2] animate-pulse">Determining advantage...</p>
+                    </div>
+                )}
+
+                {winner && !flipping && (
+                    <div className="py-6 md:py-8 text-center animate-fade-in">
+                        <div className="w-20 h-20 md:w-24 md:h-24 mx-auto rounded-full bg-gradient-to-br from-[#ffd700] to-[#b8860b] shadow-[0_0_40px_rgba(255,215,0,0.6)] flex items-center justify-center mb-5 md:mb-6">
+                            <span className="font-black text-2xl md:text-3xl text-white">{winner.charAt(0).toUpperCase()}</span>
+                        </div>
+
+                        <h2 className="text-2xl md:text-3xl font-black text-white mb-2">
+                            {winner} Wins!
+                        </h2>
+                        <p className="text-[#5b79ef] font-mono text-xs md:text-sm tracking-widest uppercase mb-6 md:mb-8">
+                            Gets Draft Pick #1
+                        </p>
+
+                        <GlowButton onClick={handleContinue} className="w-full">
+                            ENTER THE DRAFT
+                        </GlowButton>
+                    </div>
+                )}
+
+            </div>
+        </div>
+    );
+}

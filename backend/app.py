@@ -1,0 +1,1229 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+import os
+import threading
+import pandas as pd
+import numpy as np
+
+# Import the logic and engine classes you provided
+from simulation_engine import (
+    clean_and_prepare_data,
+    derive_player_profiles_v5,
+    get_match_state,
+    generate_remaining_batting_lineup,
+    generate_realistic_bowling_plan,
+    BallProbabilityEngine,
+    SingleMatchSimulator,
+    MonteCarloEngine,
+    WhatIfEngine,
+    ScenarioParser,
+    SituationAwarenessEngine,
+    ScenarioImpactAnalyzer
+)
+
+app = FastAPI(title="What-If Engine AI")
+
+allowed_origins = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+]
+frontend_url = os.environ.get("FRONTEND_URL")
+if frontend_url:
+    # Support comma-separated origins
+    origins = [o.strip() for o in frontend_url.split(",") if o.strip()]
+    allowed_origins.extend(origins)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------
+# GLOBAL STATE & INITIALIZATION
+# ---------------------------------------------------------
+df_clean = None
+raw_df = None
+match_df = None
+profiles = None
+prob_engine = None
+simulator = None
+mc_engine = None
+what_if_engine = None
+engine_status = "starting"
+engine_error = None
+engine_init_lock = threading.Lock()
+
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_PATH = os.path.join(BACKEND_DIR, "IPL_ball_by_ball_cleaned.csv")
+MATCH_DATA_PATH = os.path.join(BACKEND_DIR, "ipl_cleaned.csv")
+
+def initialize_engine():
+    """Load the heavy data model without blocking the web server's health route."""
+    global df_clean, raw_df, match_df, profiles, prob_engine, simulator, mc_engine
+    global what_if_engine, engine_status, engine_error
+
+    if not engine_init_lock.acquire(blocking=False):
+        return
+
+    try:
+        if not os.path.exists(DATA_PATH) or not os.path.exists(MATCH_DATA_PATH):
+            engine_status = "error"
+            engine_error = f"Missing {DATA_PATH} or {MATCH_DATA_PATH}"
+            print(f"⚠️ Warning: {engine_error}")
+            return
+
+        print("🚀 Initializing Engine Data in background...")
+        loaded_raw = pd.read_csv(DATA_PATH)
+        loaded_matches = pd.read_csv(MATCH_DATA_PATH)
+        loaded_clean = clean_and_prepare_data(loaded_raw)
+        loaded_profiles = derive_player_profiles_v5(loaded_raw, prior_weight=25)
+
+        scenario_parser = ScenarioParser(loaded_profiles)
+        situation_engine = SituationAwarenessEngine()
+        impact_analyzer = ScenarioImpactAnalyzer(scenario_parser)
+        loaded_prob_engine = BallProbabilityEngine(loaded_profiles, situation_engine, impact_analyzer)
+        loaded_simulator = SingleMatchSimulator(loaded_prob_engine)
+        loaded_mc_engine = MonteCarloEngine(loaded_simulator, num_simulations=500)
+        loaded_what_if_engine = WhatIfEngine(
+            loaded_clean, loaded_raw, loaded_matches, loaded_simulator, loaded_mc_engine,
+            scenario_parser=scenario_parser, impact_analyzer=impact_analyzer
+        )
+
+        # Publish the fully constructed engine atomically. Requests either see
+        # the old empty state or the complete model, never a half-built graph.
+        raw_df = loaded_raw
+        match_df = loaded_matches
+        df_clean = loaded_clean
+        profiles = loaded_profiles
+        prob_engine = loaded_prob_engine
+        simulator = loaded_simulator
+        mc_engine = loaded_mc_engine
+        what_if_engine = loaded_what_if_engine
+        engine_status = "ok"
+        engine_error = None
+        print("✅ Engine Online (Scenario-Biased Mode).")
+    except Exception as exc:
+        engine_status = "error"
+        engine_error = str(exc)
+        print(f"❌ Engine initialization failed: {exc}")
+    finally:
+        engine_init_lock.release()
+
+
+@app.on_event("startup")
+def startup_event():
+    global engine_status
+    engine_status = "warming"
+    threading.Thread(target=initialize_engine, name="counterplay-engine-init", daemon=True).start()
+
+
+# ---------------------------------------------------------
+# API MODELS
+# ---------------------------------------------------------
+class CustomState(BaseModel):
+    score: int
+    wickets: int
+    legal_balls_bowled: int
+    striker: str
+    non_striker: str
+    current_bowler: str
+    initialBatters: Optional[dict] = None
+    initialBowlers: Optional[dict] = None
+    batting_lineup: Optional[List[str]] = None
+    target: Optional[int] = None
+
+class ModificationRequest(BaseModel):
+    match_id: str
+    innings: int
+    over: int
+    ball_no: int
+    new_runs: Optional[int] = None
+    force_wicket: Optional[bool] = False
+    new_striker: Optional[str] = None
+    new_bowler: Optional[str] = None
+    outcome_override: Optional[str] = None
+    temperature: Optional[float] = 0.7
+    custom_state: Optional[CustomState] = None
+
+
+class PlayerPayload(BaseModel):
+    id: str
+    name: str
+    simName: Optional[str] = None
+    role: str
+    style: Optional[str] = ""
+    avgSR: Optional[float] = 0.0
+    avg: Optional[float] = 0.0
+    economy: Optional[float] = 0.0
+    wicketsPerMatch: Optional[float] = 0.0
+    type: str # batter | bowler | allrounder | wk
+    cost: Optional[int] = 0
+    imgColor: Optional[str] = "#FFFFFF"
+
+class ArenaFullRequest(BaseModel):
+    p1: str
+    p2: str
+    t1Roster: List[PlayerPayload]
+    t2Roster: List[PlayerPayload]
+    t1BowlingOrder: List[PlayerPayload]
+    t2BowlingOrder: List[PlayerPayload]
+    tossWinner: int
+    tossDecision: str
+
+
+# ---------------------------------------------------------
+# [1] TIME MACHINE ROUTES
+# ---------------------------------------------------------
+@app.get("/api/health")
+def health_check():
+    if engine_status == "error":
+        return {"status": "error", "message": "Engine initialization failed. Check service logs."}
+    if what_if_engine is None:
+        return {"status": "warming", "message": "Engine data is loading."}
+    return {"status": "ok", "message": "Engine is loaded and ready."}
+
+
+@app.post("/api/simulate/what-if")
+def simulate_historical_modification(req: ModificationRequest):
+    if what_if_engine is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized. Dataset missing.")
+        
+    try:
+        # Get baseline state
+        state, actual_outcome = what_if_engine.get_ball_state(
+            req.match_id, req.innings, req.over, req.ball_no
+        )
+
+        modification = {
+            "new_runs": req.new_runs,
+            "force_wicket": req.force_wicket,
+            "new_striker": req.new_striker,
+            "new_bowler": req.new_bowler
+        }
+
+        # Apply user changes
+        modified_state = what_if_engine.apply_modification(state, modification)
+
+        # Run scenario-biased simulation
+        temperature = req.temperature if req.temperature else 0.7
+        whatif_score, whatif_wickets, whatif_mc = what_if_engine.simulate_counterfactual(
+            original_state=state,
+            modified_state=modified_state,
+            modification=modification,
+            temperature=temperature
+        )
+
+        return {
+            "success": True,
+            "actual_outcome": actual_outcome,
+            # Core stats
+            "win_probability": whatif_mc["win_probability"],
+            "win_probability_change": whatif_mc.get("win_probability_change"),
+            "projected_median_score": whatif_mc["projected_median_score"],
+            "projected_mean_score": whatif_mc.get("projected_mean_score"),
+            "std_dev": whatif_mc["std_dev"],
+            # Score distribution
+            "best_case_score": whatif_mc.get("best_case_score"),
+            "worst_case_score": whatif_mc.get("worst_case_score"),
+            "most_likely_score_range": whatif_mc.get("most_likely_score_range"),
+            # Impact analysis
+            "impact_score": whatif_mc.get("impact_score"),
+            "impact_label": whatif_mc.get("impact_label"),
+            "scenario_reason": whatif_mc.get("scenario_reason", []),
+            # Match outcomes
+            "outcomes": whatif_mc.get("outcomes"),
+            # Meta
+            "confidence": whatif_mc.get("confidence"),
+            "simulations_run": whatif_mc.get("simulations_run"),
+            "temperature": whatif_mc.get("temperature")
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------
+# [2] THE ARENA ROUTES
+# ---------------------------------------------------------
+
+@app.post("/api/simulate/arena/full")
+def simulate_arena_full(req: ArenaFullRequest):
+    if simulator is None:
+        raise HTTPException(status_code=503, detail="Simulator Engine Offline")
+        
+    try:
+        t1_bat = [(p.simName if p.simName else p.name) for p in req.t1Roster]
+        t2_bat = [(p.simName if p.simName else p.name) for p in req.t2Roster]
+        t1_bowl = [(p.simName if p.simName else p.name) for p in req.t1BowlingOrder] * 4  # Expand to cover 20 overs
+        t2_bowl = [(p.simName if p.simName else p.name) for p in req.t2BowlingOrder] * 4
+        
+        # Determine who bats first
+        t1_bats_first = (req.tossWinner == 1 and req.tossDecision == 'bat') or (req.tossWinner == 2 and req.tossDecision == 'bowl')
+        
+        bat1 = t1_bat if t1_bats_first else t2_bat
+        bowl1 = t2_bowl if t1_bats_first else t1_bowl
+        
+        bat2 = t2_bat if t1_bats_first else t1_bat
+        bowl2 = t1_bowl if t1_bats_first else t2_bowl
+        
+        batting_first_name = req.p1 if t1_bats_first else req.p2
+        batting_second_name = req.p2 if t1_bats_first else req.p1
+        
+        import random
+        seed = random.randint(1, 999999)
+        
+        # ── Innings 1 ──
+        state_1 = {
+            "score": 0, "wickets": 0, "balls_remaining": 120, "legal_balls_bowled": 0,
+            "striker": bat1[0], "non_striker": bat1[1], "current_bowler": bowl1[0],
+            "phase": "powerplay", "is_free_hit": False,
+            "battingTeam": batting_first_name, "bowlingTeam": batting_second_name
+        }
+        
+        lineup_1 = bat1[2:]
+        bowling_plan_1 = bowl1[1:]
+        
+        final_score_1, final_wickets_1, raw_log_1, _ = simulator.simulate_representative_trajectory(
+            state_1, lineup_1, bowling_plan_1, num_sims=50, seed=seed
+        )
+        
+        # ── Enrich ball log with fields LiveDashboard expects ──
+        def enrich_log(raw_log, inn_val, start_balls=0):
+            enriched = []
+            legal_count = start_balls
+            for ball in raw_log:
+                if ball.get('inningsTransition'):
+                    enriched.append(ball)
+                    continue
+                    
+                outcome = ball.get('outcome', '0')
+                is_wicket = outcome == 'W'
+                is_wide = outcome == 'wide'
+                is_nb = outcome == 'no_ball'
+                extra_type = 'wide' if is_wide else ('nb' if is_nb else None)
+                is_legal = not is_wide and not is_nb
+                
+                runs = 0
+                if not is_wicket and not is_wide and not is_nb:
+                    runs = int(outcome)
+                total_runs = 1 if (is_wide or is_nb) else runs
+                
+                if is_legal:
+                    legal_count += 1
+                
+                enriched.append({
+                    "score": ball['score'],
+                    "wickets": ball['wickets'],
+                    "outcome": str(outcome),
+                    "striker": ball.get('striker', ''),
+                    "non_striker": ball.get('non_striker', ''),
+                    "bowler": ball.get('bowler', ''),
+                    "isWicket": is_wicket,
+                    "extraType": extra_type,
+                    "runs": runs,
+                    "totalRuns": total_runs,
+                    "legalBalls": legal_count,
+                    "aggression": ball.get('aggression', 1.0),
+                    "confidence": ball.get('confidence', 1.0),
+                    "innings": inn_val,
+                })
+            return enriched
+        
+        log_1 = enrich_log(raw_log_1, 1, 0)
+        
+        # Target
+        target = final_score_1 + 1
+        
+        # Transition marker
+        log_1.append({
+            "inningsTransition": True,
+            "target": target,
+            "battingTeam": batting_second_name,
+            "bowlingTeam": batting_first_name,
+            "innings1Score": f"{final_score_1}/{final_wickets_1}",
+            "innings": 1
+        })
+        
+        # ── Innings 2 ──
+        state_2 = {
+            "score": 0, "wickets": 0, "balls_remaining": 120, "legal_balls_bowled": 0,
+            "striker": bat2[0], "non_striker": bat2[1], "current_bowler": bowl2[0],
+            "phase": "powerplay", "is_free_hit": False, "target": target,
+            "battingTeam": batting_second_name, "bowlingTeam": batting_first_name
+        }
+        
+        lineup_2 = bat2[2:]
+        bowling_plan_2 = bowl2[1:]
+        
+        final_score_2, final_wickets_2, raw_log_2, win_prob = simulator.simulate_representative_trajectory(
+            state_2, lineup_2, bowling_plan_2, num_sims=50, seed=seed+1
+        )
+        
+        log_2 = enrich_log(raw_log_2, 2, 0)
+        full_log = log_1 + log_2
+        
+        # ── Determine winner ──
+        chased = final_score_2 >= target
+        if chased:
+            winner_name = batting_second_name
+            winner_type = "chase"
+        else:
+            winner_name = batting_first_name
+            winner_type = "defend"
+        
+        return {
+            "success": True,
+            "innings": 1,
+            # simResult-compatible fields
+            "startScore": 0,
+            "startWickets": 0,
+            "startBalls": 0,
+            "startStriker": bat1[0],
+            "startNonStriker": bat1[1],
+            "startBowler": bowl1[0],
+            "initialBatters": {},
+            "initialBowlers": {},
+            "newTarget": target,
+            # Arena-specific
+            "targetScore": target,
+            "innings1Score": final_score_1,
+            "innings1Wickets": final_wickets_1,
+            "finalScore": final_score_2,
+            "finalWickets": final_wickets_2,
+            "ballLog": full_log,
+            "winProb": win_prob,
+            "winnerName": winner_name,
+            "winnerType": winner_type,
+            "battingFirst": batting_first_name,
+            "battingSecond": batting_second_name,
+        }
+        
+    except Exception as e:
+        print(f"Arena Simulation Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------
+# [3] METADATA ROUTES (DYNAMIC UI)
+# ---------------------------------------------------------
+
+@app.get("/api/metadata/years")
+def get_years():
+    if match_df is None:
+        raise HTTPException(status_code=503, detail="Dataset not loaded")
+    
+    # IPL Season 1 = 2008, Season N = 2007+N
+    seasons = sorted(match_df['season'].dropna().unique().astype(int).tolist(), reverse=True)
+    years = [2007 + s for s in seasons]
+    return {"years": years}
+
+@app.get("/api/metadata/teams")
+def get_teams(year: int):
+    if match_df is None:
+        raise HTTPException(status_code=503, detail="Dataset not loaded")
+    
+    season_num = year - 2007  # convert calendar year to IPL season number
+    year_df = match_df[match_df['season'] == season_num]
+    teams = pd.concat([year_df['team1'], year_df['team2']]).dropna().str.strip().unique()
+    return {"teams": sorted(teams.tolist())}
+
+@app.get("/api/metadata/matches")
+def get_matches(year: int, team: str):
+    if match_df is None:
+        raise HTTPException(status_code=503, detail="Dataset not loaded")
+    
+    season_num = year - 2007
+    year_df = match_df[match_df['season'] == season_num].copy()
+    
+    team_matches = year_df[
+        (year_df['team1'].str.strip() == team.strip()) | 
+        (year_df['team2'].str.strip() == team.strip())
+    ]
+    
+    results = []
+    for idx, row in team_matches.iterrows():
+        opposition = row['team2'] if str(row['team1']).strip() == team.strip() else row['team1']
+        margin_val = row.get('result_margin', None)
+        margin_str = f"{int(margin_val)} {str(row.get('result', 'runs')).strip()}" if pd.notna(margin_val) and margin_val not in (None, "") else "N/A"
+        def team_color(t):
+            t = str(t)
+            if "Chennai" in t: return "#F9CD05"
+            if "Mumbai" in t: return "#004BA0"
+            if "Royal" in t: return "#D4213D"
+            if "Kolkata" in t: return "#3A225D"
+            if "Gujarat" in t: return "#1B2133"
+            if "Rajasthan" in t: return "#EB1B99"
+            if "Sunrisers" in t or "Hyderabad" in t or "Deccan" in t: return "#FF822A"
+            if "Punjab" in t: return "#D71920"
+            if "Delhi" in t: return "#0078BC"
+            if "Pune" in t: return "#9C27B0"
+            return "#00e5ff"
+
+        t1 = str(row['team1']).strip()
+        t2 = str(row['team2']).strip()
+        
+        results.append({
+            "id": str(row['new_match_id']),
+            "title": f"vs {opposition}",
+            "team1": {"name": t1, "short": t1[:3].upper(), "color": team_color(t1)},
+            "team2": {"name": t2, "short": t2[:3].upper(), "color": team_color(t2)},
+            "date": f"IPL {year} — Match {int(row['match_number'])}",
+            "venue": str(row.get('venue', "Unknown")),
+            "winner": str(row.get('winner', "Unknown")),
+            "margin": margin_str,
+        })
+        
+    return {"matches": results}
+
+
+# ---------------------------------------------------------
+# [4] BALL-BY-BALL, ROSTERS & INNINGS DETAIL ROUTES
+# ---------------------------------------------------------
+
+def _resolve_bb_match_id(match_id: str):
+    """IDs are now standardized across both datasets."""
+    return match_id
+
+
+@app.get("/api/match/{match_id}/balls")
+def get_match_balls(match_id: str):
+    """Return ball-by-ball data for both innings, structured for the frontend."""
+    if df_clean is None:
+        raise HTTPException(status_code=503, detail="Dataset not loaded")
+
+    bb_id = _resolve_bb_match_id(match_id)
+    if bb_id is None:
+        raise HTTPException(status_code=404, detail="No ball-by-ball data for this match")
+
+    result = {}
+    for inn_num in [1, 2]:
+        inn_df = df_clean[(df_clean['match_id'] == bb_id) & (df_clean['innings'] == inn_num)].copy()
+        if inn_df.empty:
+            continue
+        inn_df = inn_df.sort_values('legal_balls_bowled').reset_index(drop=True)
+
+        balls = []
+        for _, row in inn_df.iterrows():
+            w_val = row.get('wides', 0)
+            n_val = row.get('noballs', 0)
+            extra_type = 'wide' if w_val > 0 else ('nb' if n_val > 0 else None)
+
+            balls.append({
+                "over": int(row['over']),
+                "ball": int(row['ball_no']),
+                "striker": str(row['striker']),
+                "non_striker": str(row.get('non_striker', '')),
+                "bowler": str(row['bowler']),
+                "totalRuns": int(row['total_runs_this_ball']),
+                "runsOffBat": int(row['runs_off_bat']),
+                "extras": int(row['extras']),
+                "isWicket": bool(row['is_wicket']),
+                "cumScore": int(row['cumulative_score']),
+                "cumWickets": int(row['cumulative_wickets']),
+                "legalBalls": int(row['legal_balls_bowled']),
+                "phase": str(row['phase']),
+                "extraType": extra_type,
+                "player_dismissed": str(row['player_dismissed']) if pd.notna(row.get('player_dismissed')) else None,
+            })
+
+        result[str(inn_num)] = {
+            "battingTeam": str(inn_df.iloc[0]['batting_team']),
+            "bowlingTeam": str(inn_df.iloc[0]['bowling_team']),
+            "totalScore": int(inn_df['cumulative_score'].max()),
+            "totalWickets": int(inn_df['cumulative_wickets'].max()),
+            "totalOvers": f"{inn_df['over'].max()}.{inn_df.iloc[-1]['ball_no']}",
+            "balls": balls,
+        }
+
+    return result
+
+
+@app.get("/api/match/{match_id}/rosters")
+def get_match_rosters(match_id: str):
+    """Return playing XI for both teams."""
+    if match_df is None:
+        raise HTTPException(status_code=503, detail="Dataset not loaded")
+    
+    # Filter by standardized ID
+    m_row = match_df[match_df['new_match_id'] == match_id]
+    if m_row.empty:
+        raise HTTPException(status_code=404, detail="Match not found")
+    
+    m_row = m_row.iloc[0]
+    import ast
+
+    def parse_xi(raw_str):
+        try:
+            s = str(raw_str)
+            if s.startswith('['):
+                return [str(p).strip() for p in ast.literal_eval(s)]
+            return [p.strip() for p in s.split(',') if p.strip()]
+        except Exception:
+            return []
+
+    return {
+        "team1": {
+            "name": str(m_row['team1']).strip(),
+            "players": parse_xi(m_row.get('team1_players', ''))
+        },
+        "team2": {
+            "name": str(m_row['team2']).strip(),
+            "players": parse_xi(m_row.get('team2_players', ''))
+        }
+    }
+
+
+@app.get("/api/match/{match_id}/innings-detail")
+def get_innings_detail(match_id: str, innings: int = 1):
+    """
+    Return detailed innings breakdown:
+    - wicketEvents: all wicket falls with over, score, batsman dismissed, bowler, how out
+    - overSummaries: end-of-over snapshots with score, RR, batsmen, next bowler
+    """
+    if df_clean is None or raw_df is None:
+        raise HTTPException(status_code=503, detail="Dataset not loaded")
+
+    bb_id = _resolve_bb_match_id(match_id)
+    if bb_id is None:
+        raise HTTPException(status_code=404, detail="No ball-by-ball data for this match")
+
+    inn_df = df_clean[(df_clean['match_id'] == bb_id) & (df_clean['innings'] == innings)].copy()
+    if inn_df.empty:
+        raise HTTPException(status_code=404, detail=f"Innings {innings} not found")
+    inn_df = inn_df.sort_values('legal_balls_bowled').reset_index(drop=True)
+
+    # Get raw data for wicket details (player_dismissed, wicket_type)
+    raw_inn = raw_df[(raw_df['match_id'] == bb_id) & (raw_df['innings'] == innings)].copy()
+    if 'over' not in raw_inn.columns and 'ball' in raw_inn.columns:
+        raw_inn['over'] = np.floor(raw_inn['ball']).astype(int)
+        raw_inn['ball_no'] = np.round((raw_inn['ball'] - raw_inn['over']) * 10).astype(int)
+
+    # Target for 2nd innings
+    target = None
+    if innings == 2:
+        first_inn = df_clean[(df_clean['match_id'] == bb_id) & (df_clean['innings'] == 1)]
+        if not first_inn.empty:
+            target = int(first_inn['cumulative_score'].max()) + 1
+
+    batting_team = str(inn_df.iloc[0]['batting_team'])
+    bowling_team = str(inn_df.iloc[0]['bowling_team'])
+
+    # ── Wicket Events ──
+    wicket_events = []
+    wicket_rows = inn_df[inn_df['is_wicket'] == 1]
+    for _, row in wicket_rows.iterrows():
+        over_ball = f"{int(row['over'])}.{int(row['ball_no'])}"
+        score_at = int(row['cumulative_score'])
+        wickets_at = int(row['cumulative_wickets'])
+        balls_bowled = int(row['legal_balls_bowled'])
+        runs_remaining = (target - score_at) if target else None
+
+        # Get dismissal details from raw data
+        dismissed = str(row.get('striker', ''))
+        how_out = "unknown"
+        raw_match = raw_inn[
+            (raw_inn['innings'] == innings) &
+            (raw_inn['player_dismissed'].notna())
+        ]
+        # Try to match by over and ball
+        over_val = int(row['over'])
+        ball_val = int(row['ball_no'])
+        raw_ball = raw_match[
+            (np.floor(raw_match['ball']).astype(int) == over_val) &
+            (np.round((raw_match['ball'] - np.floor(raw_match['ball'])) * 10).astype(int) == ball_val)
+        ]
+        if not raw_ball.empty:
+            dismissed = str(raw_ball.iloc[0].get('player_dismissed', dismissed))
+            how_out = str(raw_ball.iloc[0].get('wicket_type', 'unknown'))
+
+        wicket_events.append({
+            "overBall": over_ball,
+            "over": int(row['over']),
+            "ball": int(row['ball_no']),
+            "scoreAt": f"{score_at}/{wickets_at}",
+            "score": score_at,
+            "wickets": wickets_at,
+            "ballsBowled": balls_bowled,
+            "runsRemaining": runs_remaining,
+            "target": target,
+            "dismissed": dismissed,
+            "howOut": how_out,
+            "bowler": str(row['bowler']),
+            "striker": str(row['striker']),
+            "non_striker": str(row.get('non_striker', '')),
+        })
+
+    # ── Over Summaries ──
+    over_summaries = []
+    max_over = int(inn_df['over'].max())
+    for ov in range(0, max_over + 1):
+        over_balls = inn_df[inn_df['over'] == ov]
+        if over_balls.empty:
+            continue
+        last_ball = over_balls.iloc[-1]
+        score_at = int(last_ball['cumulative_score'])
+        wickets_at = int(last_ball['cumulative_wickets'])
+        balls_in_over = len(over_balls)
+        runs_in_over = int(over_balls['total_runs_this_ball'].sum())
+        legal_balls = int(last_ball['legal_balls_bowled'])
+        overs_completed = legal_balls / 6
+        run_rate = round(score_at / overs_completed, 2) if overs_completed > 0 else 0
+        runs_remaining = (target - score_at) if target else None
+        balls_remaining = max(0, 120 - legal_balls)
+
+        # Required RR
+        req_rr = None
+        if target and balls_remaining > 0:
+            req_rr = round(((target - score_at) / balls_remaining) * 6, 2)
+
+        # Current batsmen at end of over
+        striker = str(last_ball['striker'])
+        non_striker = str(last_ball.get('non_striker', ''))
+
+        # Next over bowler
+        next_over_balls = inn_df[inn_df['over'] == ov + 1]
+        next_bowler = str(next_over_balls.iloc[0]['bowler']) if not next_over_balls.empty else None
+
+        # Wickets in this over
+        wickets_this_over = int(over_balls['is_wicket'].sum())
+
+        over_summaries.append({
+            "over": ov,
+            "overDisplay": ov + 1,   # 1-indexed for display
+            "scoreAt": f"{score_at}/{wickets_at}",
+            "score": score_at,
+            "wickets": wickets_at,
+            "runsInOver": runs_in_over,
+            "wicketsInOver": wickets_this_over,
+            "runRate": run_rate,
+            "requiredRR": req_rr,
+            "runsRemaining": runs_remaining,
+            "ballsRemaining": balls_remaining,
+            "target": target,
+            "striker": striker,
+            "nonStriker": non_striker,
+            "bowler": str(last_ball['bowler']),
+            "nextBowler": next_bowler,
+        })
+
+    return {
+        "matchId": match_id,
+        "innings": innings,
+        "battingTeam": batting_team,
+        "bowlingTeam": bowling_team,
+        "totalScore": int(inn_df['cumulative_score'].max()),
+        "totalWickets": int(inn_df['cumulative_wickets'].max()),
+        "target": target,
+        "wicketEvents": wicket_events,
+        "overSummaries": over_summaries,
+    }
+
+@app.post("/api/match/{match_id}/simulate-from")
+async def simulate_from_ball(match_id: str, request: ModificationRequest):
+    """
+    Simulation mode: Start from a specific ball and run until match ends.
+    Supports overrides for the starting ball.
+    """
+    if simulator is None:
+        raise HTTPException(status_code=503, detail="Simulator not initialized")
+
+    try:
+        # 1. Get initial state
+        if request.custom_state:
+            state = {
+                "match_id": match_id,
+                "innings": request.innings,
+                "score": request.custom_state.score,
+                "wickets": request.custom_state.wickets,
+                "legal_balls_bowled": request.custom_state.legal_balls_bowled,
+                "balls_remaining": 120 - request.custom_state.legal_balls_bowled,
+                "striker": request.custom_state.striker,
+                "non_striker": request.custom_state.non_striker,
+                "current_bowler": request.custom_state.current_bowler,
+                "initialBatters": request.custom_state.initialBatters or {},
+                "initialBowlers": request.custom_state.initialBowlers or {},
+                "over": request.over,
+                "ball_no": request.ball_no
+            }
+            # Add target
+            if request.innings == 2:
+                if request.custom_state.target is not None:
+                    target_val = request.custom_state.target
+                else:
+                    first_inn = df_clean[(df_clean['match_id'] == match_id) & (df_clean['innings'] == 1)]
+                    target_val = int(first_inn['cumulative_score'].max()) + 1 if not first_inn.empty else 150
+                state['target'] = target_val
+                state['runs_required'] = max(0, target_val - state['score'])
+            else:
+                state['target'] = None
+
+            # Phase
+            state['phase'] = 'powerplay' if request.over <= 5 else 'middle' if request.over <= 14 else 'death'
+
+            # Batting lineup
+            if request.custom_state.batting_lineup is not None:
+                lineup = request.custom_state.batting_lineup
+            else:
+                lineup = generate_remaining_batting_lineup(raw_df, match_df, state)
+        else:
+            state = get_match_state(
+                df_clean, match_id, request.innings, request.over, request.ball_no
+            )
+            # map state keys to what simulator expects
+            state['score'] = state.pop('current_score')
+            state['wickets'] = state.pop('current_wickets')
+            state['current_bowler'] = state['bowler']
+
+            # 2. Apply modifications to the first ball if provided
+            if request.new_striker: state['striker'] = request.new_striker
+            if request.new_bowler: state['current_bowler'] = request.new_bowler
+            
+            # Ensure non_striker is present in state
+            if 'non_striker' not in state:
+                state['non_striker'] = "" # Fallback
+            
+            # 3. Build context for simulation
+            lineup = generate_remaining_batting_lineup(raw_df, match_df, state)
+
+        
+        # Build bowling plan historically, preventing consecutive overs
+        innings_df = df_clean[
+            (df_clean['match_id'] == match_id) &
+            (df_clean['innings'] == request.innings)
+        ]
+        over_bowler_map = innings_df.sort_values('over').drop_duplicates('over').set_index('over')['bowler'].to_dict()
+        
+        current_over = state['legal_balls_bowled'] // 6
+        bowling_plan = []
+        last_b = state['current_bowler']
+        all_bowlers = innings_df['bowler'].unique().tolist()
+        
+        for o in range(current_over + 1, 20):
+            b = over_bowler_map.get(o)
+            if not b or b == last_b:
+                avail = [x for x in all_bowlers if x != last_b]
+                b = avail[0] if avail else last_b
+            bowling_plan.append(b)
+            last_b = b
+
+        # 4. Advance the state by the overridden ball itself before starting simulation
+        # This prevents the simulator from re-simulating the selected ball and misaligning strike rotation
+        if request.outcome_override:
+            outcome = request.outcome_override
+            if outcome == 'nb': outcome = 'no_ball'
+        else:
+            row = innings_df[(innings_df['over'] == request.over) & (innings_df['ball_no'] == request.ball_no)]
+            if not row.empty:
+                r = row.iloc[0]
+                if int(r['is_wicket']) == 1: outcome = "W"
+                elif float(r['wides']) > 0: outcome = "wide"
+                elif float(r['noballs']) > 0: outcome = "no_ball"
+                else: outcome = str(int(r['runs_off_bat']))
+            else:
+                outcome = "0"
+                
+        is_legal, runs_this_ball = True, 0
+        if outcome in ['wide', 'no_ball']: is_legal = False; state['score'] += 1
+        elif outcome == 'W':
+            state['wickets'] += 1
+            if lineup: state['striker'] = lineup.pop(0)
+        else:
+            runs_this_ball = int(outcome)
+            state['score'] += runs_this_ball
+
+        if is_legal:
+            state['legal_balls_bowled'] += 1
+            state['balls_remaining'] -= 1
+            if runs_this_ball in [1, 3]: state['striker'], state['non_striker'] = state['non_striker'], state['striker']
+            if state['legal_balls_bowled'] % 6 == 0:
+                state['striker'], state['non_striker'] = state['non_striker'], state['striker']
+                if bowling_plan: state['current_bowler'] = bowling_plan.pop(0)
+
+        # 5. Make it Deterministic (Stable Seed based on scenario)
+        import zlib
+        seed_str = f"{match_id}_{request.innings}_{request.over}_{request.ball_no}_{outcome}"
+        scenario_seed = zlib.adler32(seed_str.encode('utf-8'))
+
+        # 6. Simulate representative trajectory for the REST of the match
+        final_score, final_wickets, log, win_prob = simulator.simulate_representative_trajectory(
+            state, lineup, bowling_plan, num_sims=100, seed=scenario_seed
+        )
+
+        new_target = None
+        if request.innings == 1:
+            target_2 = final_score + 1
+            new_target = target_2
+            try:
+                state_2 = get_match_state(df_clean, match_id, 2, 0, 1)
+                state_2['score'] = state_2.pop('current_score')
+                state_2['wickets'] = state_2.pop('current_wickets')
+                state_2['current_bowler'] = state_2['bowler']
+                state_2['target'] = target_2
+                state_2['runs_required'] = target_2
+
+                lineup_2 = generate_remaining_batting_lineup(raw_df, match_df, state_2)
+
+                innings_df_2 = df_clean[(df_clean['match_id'] == match_id) & (df_clean['innings'] == 2)]
+                if not innings_df_2.empty:
+                    over_bowler_map_2 = innings_df_2.sort_values('over').drop_duplicates('over').set_index('over')['bowler'].to_dict()
+                    bowling_plan_2 = []
+                    last_b_2 = state_2['current_bowler']
+                    all_bowlers_2 = innings_df_2['bowler'].unique().tolist()
+                    for o in range(0, 20):
+                        b = over_bowler_map_2.get(o)
+                        if not b or b == last_b_2:
+                            avail = [x for x in all_bowlers_2 if x != last_b_2]
+                            b = avail[0] if avail else last_b_2
+                        bowling_plan_2.append(b)
+                        last_b_2 = b
+
+                    # Insert transition message into log
+                    log.append({
+                        "isOverBreak": True,
+                        "message": f"End of 1st Innings! Target set to {target_2}. Next bowler: {state_2['current_bowler']}",
+                        "score": final_score,
+                        "wickets": final_wickets,
+                        "inningsTransition": True
+                    })
+
+                    seed_str_2 = f"{match_id}_2_0_1_auto_{final_score}"
+                    scenario_seed_2 = zlib.adler32(seed_str_2.encode('utf-8'))
+
+                    final_score_2, final_wickets_2, log_2, win_prob_2 = simulator.simulate_representative_trajectory(
+                        state_2, lineup_2, bowling_plan_2, num_sims=100, seed=scenario_seed_2
+                    )
+
+                    log.extend(log_2)
+                    final_score = final_score_2
+                    final_wickets = final_wickets_2
+                    win_prob = win_prob_2
+            except Exception as e2:
+                print(f"Could not automatically simulate 2nd innings: {e2}")
+
+        return {
+            "success": True,
+            "innings": request.innings,
+            "startScore": state['score'],
+            "startWickets": state['wickets'],
+            "startBalls": state['legal_balls_bowled'],
+            "startStriker": state['striker'],
+            "startNonStriker": state['non_striker'],
+            "startBowler": state['current_bowler'],
+            "initialBatters": state.get('initialBatters', {}),
+            "initialBowlers": state.get('initialBowlers', {}),
+            "finalScore": final_score,
+            "finalWickets": final_wickets,
+            "ballLog": log,
+            "winProb": win_prob,
+            "newTarget": new_target
+        }
+    except Exception as e:
+        print(f"Simulation Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------
+# ARENA PLAYER POOL — All unique IPL players with computed stats
+# ---------------------------------------------------------
+
+# Known wicket-keepers (hard to infer purely from ball-by-ball)
+_KNOWN_WK = {
+    "MS Dhoni", "AB de Villiers", "Adam Gilchrist", "Rishabh Pant", "Jos Buttler",
+    "Quinton de Kock", "Heinrich Klaasen", "Kumar Sangakkara", "Jonny Bairstow",
+    "Sanju Samson", "Nicholas Pooran", "KL Rahul", "Robin Uthappa",
+    "Dinesh Karthik", "Wriddhiman Saha", "Parthiv Patel", "Brendon McCullum",
+    "Naman Ojha", "Matthew Wade", "Ishan Kishan", "Prithvi Shaw", "Phil Salt",
+    "Kusal Mendis", "Litton Das", "Rahul Tripathi", "Tim Paine"
+}
+
+_ARENA_PLAYER_CACHE = None
+
+def _build_arena_player_pool():
+    global _ARENA_PLAYER_CACHE
+    if _ARENA_PLAYER_CACHE is not None:
+        return _ARENA_PLAYER_CACHE
+
+    if raw_df is None:
+        return []
+
+    df = raw_df.copy()
+
+    # Fill nulls in extras columns
+    for col in ['wides', 'noballs', 'byes', 'legbyes']:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
+
+    # ── Batting stats ─────────────────────────────────────────
+    # Only legal deliveries for SR/avg (exclude wides)
+    df_bat = df[df.get('wides', pd.Series(0, index=df.index)) == 0].copy() if 'wides' in df.columns else df.copy()
+
+    bat_grp = df.groupby('striker')
+    bat_balls = bat_grp['runs_off_bat'].count().rename('balls_faced')
+    bat_runs  = bat_grp['runs_off_bat'].sum().rename('runs')
+    bat_matches = bat_grp['match_id'].nunique().rename('bat_matches')
+
+    if 'player_dismissed' in df.columns:
+        dismissals = df[df['player_dismissed'].notna()].groupby('striker').size().rename('dismissals')
+    else:
+        dismissals = pd.Series(dtype=int)
+
+    batting = pd.concat([bat_balls, bat_runs, bat_matches], axis=1).reset_index()
+    batting = batting.merge(dismissals.reset_index().rename(columns={'striker': 'striker', 0: 'dismissals'}), on='striker', how='left')
+    if 'dismissals' not in batting.columns:
+        batting['dismissals'] = 0
+    batting['dismissals'] = batting['dismissals'].fillna(0)
+    batting['avg_sr'] = ((batting['runs'] / batting['balls_faced'].replace(0, 1)) * 100).round(1)
+    batting['avg']    = (batting['runs'] / batting['dismissals'].replace(0, 1)).round(1)
+
+    # ── Bowling stats ─────────────────────────────────────────
+    bowl_grp = df.groupby('bowler')
+    bowl_balls   = bowl_grp['runs_off_bat'].count().rename('balls_bowled')
+    bowl_runs    = (bowl_grp['runs_off_bat'].sum() + bowl_grp.get_group if False else bowl_grp['runs_off_bat'].sum()).rename('runs_conceded')
+    bowl_matches = bowl_grp['match_id'].nunique().rename('bowl_matches')
+
+    # Include extras in runs conceded
+    if 'extras' in df.columns:
+        extras_by_bowler = df.groupby('bowler')['extras'].sum()
+        bowl_runs = (df.groupby('bowler')['runs_off_bat'].sum() + extras_by_bowler).rename('runs_conceded')
+
+    if 'player_dismissed' in df.columns:
+        wickets = df[df['player_dismissed'].notna()].groupby('bowler').size().rename('wickets')
+    else:
+        wickets = pd.Series(dtype=int)
+
+    bowling = pd.concat([bowl_balls, bowl_runs, bowl_matches], axis=1).reset_index()
+    bowling = bowling.merge(wickets.reset_index().rename(columns={'bowler': 'bowler', 0: 'wickets'}), on='bowler', how='left')
+    if 'wickets' not in bowling.columns:
+        bowling['wickets'] = 0
+    bowling['wickets'] = bowling['wickets'].fillna(0)
+    bowling['economy'] = ((bowling['runs_conceded'] / (bowling['balls_bowled'] / 6).replace(0, 1))).round(2)
+    bowling['wpm']     = (bowling['wickets'] / bowling['bowl_matches'].replace(0, 1)).round(2)
+
+    # ── Merge and classify ────────────────────────────────────
+    bat = batting.rename(columns={'striker': 'name'})
+    bowl = bowling.rename(columns={'bowler': 'name'})
+
+    merged = pd.merge(bat, bowl, on='name', how='outer').fillna(0)
+
+    def classify(row):
+        b_balls = row.get('balls_faced', 0)
+        bwl_balls = row.get('balls_bowled', 0)
+        name = row['name']
+        if name in _KNOWN_WK:
+            return 'wk'
+        # Significant bowler: bowled 120+ balls (20 overs) AND bats little
+        if bwl_balls >= 120 and b_balls <= 120:
+            return 'bowler'
+        # Significant batter: faced 60+ balls and barely bowled
+        if b_balls >= 60 and bwl_balls < 60:
+            return 'batter'
+        # All-rounder: meaningful contribution in both
+        if bwl_balls >= 60 and b_balls >= 60:
+            return 'allrounder'
+        # Default by dominance
+        return 'bowler' if bwl_balls > b_balls else 'batter'
+
+    def make_role_label(t):
+        return {'batter': 'Batter', 'wk': 'WK-Batter', 'allrounder': 'All-Rounder', 'bowler': 'Bowler'}.get(t, 'Batter')
+
+    def calc_cost(row, ptype):
+        """Simple cost 1-10 based on performance metrics."""
+        if ptype in ('batter', 'wk'):
+            sr = row.get('avg_sr', 0)
+            avg = row.get('avg', 0)
+            score = min(10, max(1, round((sr / 20) * 0.6 + (avg / 10) * 0.4)))
+        elif ptype == 'bowler':
+            econ = row.get('economy', 10)
+            wpm = row.get('wpm', 0)
+            score = min(10, max(1, round(((10 - min(econ, 12)) / 2) + wpm * 1.5)))
+        else:  # allrounder
+            sr = row.get('avg_sr', 0)
+            econ = row.get('economy', 10)
+            wpm = row.get('wpm', 0)
+            score = min(10, max(1, round((sr / 30) + ((10 - min(econ, 12)) / 3) + wpm)))
+        return int(score)
+
+    TEAM_COLOR_MAP = {
+        "Chennai": "#FCCA06", "Mumbai": "#004BA0", "Royal": "#D4213D",
+        "Kolkata": "#3A225D", "Gujarat": "#1B2133", "Rajasthan": "#EB1B99",
+        "Sunrisers": "#FF822A", "Hyderabad": "#FF822A", "Deccan": "#FF822A",
+        "Punjab": "#D71920", "Delhi": "#0078BC", "Pune": "#9C27B0",
+        "Lucknow": "#4FC3F7", "Kochi": "#E05C00",
+    }
+
+    # Get last team for each player (most recent match)
+    if 'batting_team' in df.columns:
+        last_team_bat = df.sort_values('match_id').groupby('striker')['batting_team'].last()
+        last_team_bowl = df.sort_values('match_id').groupby('bowler')['batting_team'].last()
+    else:
+        last_team_bat = pd.Series(dtype=str)
+        last_team_bowl = pd.Series(dtype=str)
+
+    def get_color(name):
+        team = last_team_bat.get(name) or last_team_bowl.get(name) or ""
+        for kw, color in TEAM_COLOR_MAP.items():
+            if kw.lower() in str(team).lower():
+                return color
+        return "#6b7280"
+
+    players = []
+    for idx, row in merged.iterrows():
+        name = row['name']
+        if not name or str(name) == 'nan' or len(str(name).strip()) < 2:
+            continue
+        ptype = classify(row)
+        cost = calc_cost(row, ptype)
+        players.append({
+            "id": f"p_{str(name).lower().replace(' ', '_').replace('.', '')}",
+            "name": str(name),
+            "role": make_role_label(ptype),
+            "type": ptype,
+            "avgSR": float(row.get('avg_sr', 120.0)),
+            "avg": float(row.get('avg', 20.0)),
+            "economy": float(row.get('economy', 8.0)),
+            "wicketsPerMatch": float(row.get('wpm', 0.5)),
+            "cost": cost,
+            "imgColor": get_color(name),
+        })
+
+    # Sort: most impactful players first
+    players.sort(key=lambda p: -p['cost'])
+
+    _ARENA_PLAYER_CACHE = players
+    return players
+
+
+@app.get("/api/arena/players")
+def get_arena_players():
+    """Return all unique IPL players with computed stats for the Arena draft."""
+    if raw_df is None:
+        raise HTTPException(status_code=503, detail="Dataset not loaded")
+    try:
+        return {"players": _build_arena_player_pool()}
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/metadata/match/{match_id}")
+def get_match_details(match_id: str):
+    if df_clean is None or raw_df is None or match_df is None:
+        raise HTTPException(status_code=503, detail="Data not loaded")
+
+    # Directly filter by standardized ID
+    m_row = match_df[match_df['new_match_id'] == match_id]
+    if m_row.empty:
+        raise HTTPException(status_code=404, detail="Match not found")
+    
+    m_row = m_row.iloc[0]
+    team1_name = str(m_row['team1']).strip()
+    team2_name = str(m_row['team2']).strip()
+    calendar_year = str(m_row['match_date'])[:4]
+
+    def team_color(t):
+        t = str(t)
+        if "Chennai" in t: return "#F9CD05"
+        if "Mumbai" in t: return "#004BA0"
+        if "Royal" in t: return "#D4213D"
+        if "Kolkata" in t: return "#3A225D"
+        if "Gujarat" in t: return "#1B2133"
+        if "Rajasthan" in t: return "#EB1B99"
+        if "Sunrisers" in t or "Hyderabad" in t or "Deccan" in t: return "#FF822A"
+        if "Punjab" in t: return "#D71920"
+        if "Delhi" in t: return "#0078BC"
+        if "Pune" in t: return "#9C27B0"
+        return "#00e5ff"
+
+    # Since IDs are standardized, target_bbid is just match_id
+    target_bbid = match_id
+
+    # 1. Get 2nd innings data
+    innings_df = df_clean[(df_clean['match_id'] == target_bbid) & (df_clean['innings'] == 2)].copy()
+    if innings_df.empty:
+        raise HTTPException(status_code=400, detail="No chase data found (may be a rain-affected match).")
+
+    first_innings = df_clean[(df_clean['match_id'] == target_bbid) & (df_clean['innings'] == 1)]
+    target = int(first_innings['cumulative_score'].max() + 1) if not first_innings.empty else 150
+
+    # 2. Build timeline
+    timeline = []
+    max_over = int(innings_df['over'].max())
+    critical_over = max(5, max_over - 2)
+
+    for o in range(max(1, critical_over - 4), critical_over + 1):
+        over_balls = innings_df[innings_df['over'] == o]
+        if not over_balls.empty:
+            last_ball = over_balls.iloc[-1]
+            score_at = int(last_ball['cumulative_score'])
+            balls_done = int(last_ball.get('legal_balls_bowled', o * 6))
+            rr = round(score_at / max(1, balls_done / 6), 2)
+            win_prob = max(5, min(95, round((score_at / target) * 100)))
+            timeline.append({"over": o, "winProb": win_prob, "rr": rr})
+
+    # 3. Critical moment state
+    crit_balls = innings_df[innings_df['over'] <= critical_over]
+    crit_state = crit_balls.iloc[-1] if not crit_balls.empty else innings_df.iloc[-1]
+
+    batting_team = str(crit_state['batting_team'])
+    bowling_team = str(crit_state['bowling_team'])
+    crit_over_str = f"{int(crit_state['over'])}.{int(crit_state['ball_no'])}"
+    score_now = int(crit_state['cumulative_score'])
+    wkts_now = int(crit_state['cumulative_wickets'])
+    balls_done = int(crit_state.get('legal_balls_bowled', critical_over * 6))
+    balls_rem = max(0, 120 - balls_done)
+    runs_needed = target - score_now
+    req_rr = round((runs_needed / max(1, balls_rem)) * 6, 2)
+    cur_rr = round((score_now / max(1, balls_done)) * 6, 2)
+
+    critical_moment = {
+        "over": crit_over_str,
+        "situation": f"{batting_team} needs {runs_needed} runs off {balls_rem} balls.",
+        "score": f"{batting_team}: {score_now}/{wkts_now}",
+        "target": target,
+        "battingTeam": batting_team,
+        "bowlingTeam": bowling_team,
+        "runRate": {"required": req_rr, "current": cur_rr},
+        "originalWinProb": {"team1": 50, "team2": 50},
+        "striker": str(crit_state.get('striker', '')),
+        "nonStriker": str(crit_state.get('non_striker', '')),
+        "currentBowler": str(crit_state.get('bowler', '')),
+        "timeline": timeline
+    }
+
+    # 4. Parse players from ipl.csv
+    try:
+        t1_raw = str(m_row.get('team1_players', ''))
+        t2_raw = str(m_row.get('team2_players', ''))
+        t1_p = [p.strip() for p in t1_raw.split(',') if p.strip()]
+        t2_p = [p.strip() for p in t2_raw.split(',') if p.strip()]
+    except:
+        t1_p, t2_p = [], []
+
+    batters_raw = t1_p if team1_name == batting_team.strip() else t2_p
+    bowlers_raw = t2_p if team1_name == batting_team.strip() else t1_p
+
+    batters = [{"id": b.replace(" ", "_").lower(), "name": b, "role": "Batter", "style": "Aggressor", "avgSR": 130, "avg": 25} for b in batters_raw if b]
+    bowlers = [{"id": b.replace(" ", "_").lower(), "name": b, "role": "Bowler", "economy": 8.0, "wicketsPerMatch": 1.2} for b in bowlers_raw if b]
+
+    return {
+        "id": str(match_id),
+        "year": calendar_year,
+        "title": f"{team1_name} vs {team2_name}",
+        "team1": {"name": team1_name, "short": team1_name[:3].upper(), "color": team_color(team1_name)},
+        "team2": {"name": team2_name, "short": team2_name[:3].upper(), "color": team_color(team2_name)},
+        "venue": str(m_row.get('venue', 'Unknown')),
+        "date": f"IPL {calendar_year} — Match {int(m_row['match_number'])}",
+        "criticalMoment": critical_moment,
+        "batters": batters,
+        "bowlers": bowlers
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
