@@ -80,6 +80,11 @@ def initialize_engine():
         print("🚀 Initializing Engine Data in background...")
         loaded_raw = pd.read_csv(DATA_PATH)
         loaded_matches = pd.read_csv(MATCH_DATA_PATH)
+        # Names, venues, and match IDs repeat across hundreds of thousands of
+        # deliveries. Share their labels through categorical codes so each
+        # request fits comfortably within the free instance's memory limit.
+        for column in loaded_raw.select_dtypes(include=["object", "str"]).columns:
+            loaded_raw[column] = loaded_raw[column].astype("category")
         loaded_clean = clean_and_prepare_data(loaded_raw)
         loaded_profiles = derive_player_profiles_v5(loaded_raw, prior_weight=25)
 
@@ -951,24 +956,18 @@ def _build_arena_player_pool():
     if raw_df is None:
         return []
 
-    df = raw_df.copy()
-
-    # Fill nulls in extras columns
-    for col in ['wides', 'noballs', 'byes', 'legbyes']:
-        if col in df.columns:
-            df[col] = df[col].fillna(0)
+    # All aggregations below are read-only. Avoid copying the entire dataset
+    # (and an unused batting frame) for the first arena request.
+    df = raw_df
 
     # ── Batting stats ─────────────────────────────────────────
-    # Only legal deliveries for SR/avg (exclude wides)
-    df_bat = df[df.get('wides', pd.Series(0, index=df.index)) == 0].copy() if 'wides' in df.columns else df.copy()
-
     bat_grp = df.groupby('striker')
     bat_balls = bat_grp['runs_off_bat'].count().rename('balls_faced')
     bat_runs  = bat_grp['runs_off_bat'].sum().rename('runs')
     bat_matches = bat_grp['match_id'].nunique().rename('bat_matches')
 
     if 'player_dismissed' in df.columns:
-        dismissals = df[df['player_dismissed'].notna()].groupby('striker').size().rename('dismissals')
+        dismissals = df.loc[df['player_dismissed'].notna(), 'striker'].value_counts().rename('dismissals')
     else:
         dismissals = pd.Series(dtype=int)
 
@@ -992,7 +991,7 @@ def _build_arena_player_pool():
         bowl_runs = (df.groupby('bowler')['runs_off_bat'].sum() + extras_by_bowler).rename('runs_conceded')
 
     if 'player_dismissed' in df.columns:
-        wickets = df[df['player_dismissed'].notna()].groupby('bowler').size().rename('wickets')
+        wickets = df.loc[df['player_dismissed'].notna(), 'bowler'].value_counts().rename('wickets')
     else:
         wickets = pd.Series(dtype=int)
 
@@ -1058,8 +1057,9 @@ def _build_arena_player_pool():
 
     # Get last team for each player (most recent match)
     if 'batting_team' in df.columns:
-        last_team_bat = df.sort_values('match_id').groupby('striker')['batting_team'].last()
-        last_team_bowl = df.sort_values('match_id').groupby('bowler')['batting_team'].last()
+        team_history = df[['match_id', 'striker', 'bowler', 'batting_team']].sort_values('match_id')
+        last_team_bat = team_history.groupby('striker')['batting_team'].last()
+        last_team_bowl = team_history.groupby('bowler')['batting_team'].last()
     else:
         last_team_bat = pd.Series(dtype=str)
         last_team_bowl = pd.Series(dtype=str)
